@@ -1,10 +1,28 @@
 import cv2
 import numpy as np
 import scipy
+# pyrefly: ignore [missing-import]
 import lap
 from scipy.spatial.distance import cdist
 
-from cython_bbox import bbox_overlaps as bbox_ious
+try:
+    from cython_bbox import bbox_overlaps as bbox_ious
+except ImportError:
+    def bbox_ious(boxes, query_boxes):
+        if len(boxes) == 0 or len(query_boxes) == 0:
+            return np.zeros((len(boxes), len(query_boxes)), dtype=float)
+        boxes = np.ascontiguousarray(boxes, dtype=float)
+        query_boxes = np.ascontiguousarray(query_boxes, dtype=float)
+        x1 = np.maximum(boxes[:, None, 0], query_boxes[None, :, 0])
+        y1 = np.maximum(boxes[:, None, 1], query_boxes[None, :, 1])
+        x2 = np.minimum(boxes[:, None, 2], query_boxes[None, :, 2])
+        y2 = np.minimum(boxes[:, None, 3], query_boxes[None, :, 3])
+        intersection = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+        area_boxes = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        area_query = (query_boxes[:, 2] - query_boxes[:, 0]) * (query_boxes[:, 3] - query_boxes[:, 1])
+        union = area_boxes[:, None] + area_query[None, :] - intersection
+        return np.where(union > 0, intersection / union, 0.0)
+
 from yolox.tracker import kalman_filter
 import time
 
@@ -58,13 +76,13 @@ def ious(atlbrs, btlbrs):
 
     :rtype ious np.ndarray
     """
-    ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float)
+    ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=float)
     if ious.size == 0:
         return ious
 
     ious = bbox_ious(
-        np.ascontiguousarray(atlbrs, dtype=np.float),
-        np.ascontiguousarray(btlbrs, dtype=np.float)
+        np.ascontiguousarray(atlbrs, dtype=float),
+        np.ascontiguousarray(btlbrs, dtype=float)
     )
 
     return ious
@@ -118,13 +136,13 @@ def embedding_distance(tracks, detections, metric='cosine'):
     :return: cost_matrix np.ndarray
     """
 
-    cost_matrix = np.zeros((len(tracks), len(detections)), dtype=np.float)
+    cost_matrix = np.zeros((len(tracks), len(detections)), dtype=float)
     if cost_matrix.size == 0:
         return cost_matrix
-    det_features = np.asarray([track.curr_feat for track in detections], dtype=np.float)
+    det_features = np.asarray([track.curr_feat for track in detections], dtype=float)
     #for i, track in enumerate(tracks):
         #cost_matrix[i, :] = np.maximum(0.0, cdist(track.smooth_feat.reshape(1,-1), det_features, metric))
-    track_features = np.asarray([track.smooth_feat for track in tracks], dtype=np.float)
+    track_features = np.asarray([track.smooth_feat for track in tracks], dtype=float)
     cost_matrix = np.maximum(0.0, cdist(track_features, det_features, metric))  # Nomalized features
     return cost_matrix
 

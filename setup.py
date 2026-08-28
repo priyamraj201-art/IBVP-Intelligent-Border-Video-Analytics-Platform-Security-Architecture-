@@ -13,6 +13,10 @@ assert torch_ver >= [1, 3], "Requires PyTorch >= 1.3"
 
 
 def get_extensions():
+    import shutil
+    import platform
+    if platform.system() == "Windows" and not shutil.which("cl.exe"):
+        return []
     this_dir = path.dirname(path.abspath(__file__))
     extensions_dir = path.join(this_dir, "yolox", "layers", "csrc")
 
@@ -47,9 +51,12 @@ with open("yolox/__init__.py", "r") as f:
     ).group(1)
 
 
-with open("README.md", "r") as f:
+with open("README.md", "r", encoding="utf-8") as f:
     long_description = f.read()
 
+
+ext_modules = get_extensions()
+cmdclass = {"build_ext": torch.utils.cpp_extension.BuildExtension} if ext_modules else {}
 
 setuptools.setup(
     name="yolox",
@@ -57,8 +64,8 @@ setuptools.setup(
     author="basedet team",
     python_requires=">=3.6",
     long_description=long_description,
-    ext_modules=get_extensions(),
+    ext_modules=ext_modules,
     classifiers=["Programming Language :: Python :: 3", "Operating System :: OS Independent"],
-    cmdclass={"build_ext": torch.utils.cpp_extension.BuildExtension},
+    cmdclass=cmdclass,
     packages=setuptools.find_namespace_packages(),
 )

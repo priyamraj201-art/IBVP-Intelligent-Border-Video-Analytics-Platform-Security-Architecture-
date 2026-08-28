@@ -10,18 +10,23 @@ from .kalman_filter import KalmanFilter
 from yolox.tracker import matching
 from .basetrack import BaseTrack, TrackState
 
+from collections import Counter, deque
+
 class STrack(BaseTrack):
     shared_kalman = KalmanFilter()
-    def __init__(self, tlwh, score):
+    def __init__(self, tlwh, score, cls=0):
 
         # wait activate
-        self._tlwh = np.asarray(tlwh, dtype=np.float)
+        self._tlwh = np.asarray(tlwh, dtype=float)
         self.kalman_filter = None
         self.mean, self.covariance = None, None
         self.is_activated = False
 
         self.score = score
         self.tracklet_len = 0
+        self.cls = int(cls)
+        self.class_history = deque(maxlen=10)
+        self.class_history.append(int(cls))
 
     def predict(self):
         mean_state = self.mean.copy()
@@ -55,6 +60,8 @@ class STrack(BaseTrack):
         # self.is_activated = True
         self.frame_id = frame_id
         self.start_frame = frame_id
+        self.class_history = deque(maxlen=10)
+        self.class_history.append(self.cls)
 
     def re_activate(self, new_track, frame_id, new_id=False):
         self.mean, self.covariance = self.kalman_filter.update(
@@ -67,6 +74,8 @@ class STrack(BaseTrack):
         if new_id:
             self.track_id = self.next_id()
         self.score = new_track.score
+        self.cls = new_track.cls
+        self.class_history.append(new_track.cls)
 
     def update(self, new_track, frame_id):
         """
@@ -86,6 +95,15 @@ class STrack(BaseTrack):
         self.is_activated = True
 
         self.score = new_track.score
+        self.cls = new_track.cls
+        self.class_history.append(new_track.cls)
+
+    @property
+    def smoothed_cls(self):
+        """Majority vote class over recent frames to prevent boundary flicker."""
+        if not self.class_history:
+            return self.cls
+        return Counter(self.class_history).most_common(1)[0][0]
 
     @property
     # @jit(nopython=True)
@@ -139,7 +157,7 @@ class STrack(BaseTrack):
         return ret
 
     def __repr__(self):
-        return 'OT_{}_({}-{})'.format(self.track_id, self.start_frame, self.end_frame)
+        return 'OT_{}_cls{}_({}-{})'.format(self.track_id, self.cls, self.start_frame, self.end_frame)
 
 
 class BYTETracker(object):
@@ -166,10 +184,12 @@ class BYTETracker(object):
         if output_results.shape[1] == 5:
             scores = output_results[:, 4]
             bboxes = output_results[:, :4]
+            classes = np.zeros(len(output_results), dtype=int)
         else:
             output_results = output_results.cpu().numpy()
             scores = output_results[:, 4] * output_results[:, 5]
             bboxes = output_results[:, :4]  # x1y1x2y2
+            classes = output_results[:, 6].astype(int) if output_results.shape[1] >= 7 else np.zeros(len(output_results), dtype=int)
         img_h, img_w = img_info[0], img_info[1]
         scale = min(img_size[0] / float(img_h), img_size[1] / float(img_w))
         bboxes /= scale
@@ -183,11 +203,13 @@ class BYTETracker(object):
         dets = bboxes[remain_inds]
         scores_keep = scores[remain_inds]
         scores_second = scores[inds_second]
+        classes_keep = classes[remain_inds]
+        classes_second = classes[inds_second]
 
         if len(dets) > 0:
             '''Detections'''
-            detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                          (tlbr, s) in zip(dets, scores_keep)]
+            detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, c) for
+                          (tlbr, s, c) in zip(dets, scores_keep, classes_keep)]
         else:
             detections = []
 
@@ -223,8 +245,8 @@ class BYTETracker(object):
         # association the untrack to the low score detections
         if len(dets_second) > 0:
             '''Detections'''
-            detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                          (tlbr, s) in zip(dets_second, scores_second)]
+            detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s, c) for
+                          (tlbr, s, c) in zip(dets_second, scores_second, classes_second)]
         else:
             detections_second = []
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]

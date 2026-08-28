@@ -3,6 +3,7 @@ import os
 import os.path as osp
 import time
 import cv2
+import numpy as np
 import torch
 
 from loguru import logger
@@ -12,6 +13,9 @@ from yolox.exp import get_exp
 from yolox.utils import fuse_model, get_model_info, postprocess
 from yolox.utils.visualize import plot_tracking
 from yolox.tracker.byte_tracker import BYTETracker
+from yolox.tracker.alert_system import MotionAlertSystem
+from yolox.anpr import ANPRPipeline, ANPRVisualizer
+from yolox.routing import TrackRouter, DetectorMode
 from yolox.tracking_utils.timer import Timer
 
 
@@ -56,6 +60,7 @@ def make_parser():
     parser.add_argument("--nms", default=None, type=float, help="test nms threshold")
     parser.add_argument("--tsize", default=None, type=int, help="test img size")
     parser.add_argument("--fps", default=30, type=int, help="frame rate (fps)")
+    parser.add_argument("--rotate", default=0, type=int, choices=[0, 90, 180, 270], help="rotate camera feed (0, 90, 180, 270 degrees)")
     parser.add_argument(
         "--fp16",
         dest="fp16",
@@ -78,7 +83,7 @@ def make_parser():
         help="Using TensorRT model for testing.",
     )
     # tracking args
-    parser.add_argument("--track_thresh", type=float, default=0.5, help="tracking confidence threshold")
+    parser.add_argument("--track_thresh", type=float, default=0.25, help="tracking confidence threshold")
     parser.add_argument("--track_buffer", type=int, default=30, help="the frames for keep lost tracks")
     parser.add_argument("--match_thresh", type=float, default=0.8, help="matching threshold for tracking")
     parser.add_argument(
@@ -87,6 +92,31 @@ def make_parser():
     )
     parser.add_argument('--min_box_area', type=float, default=10, help='filter out tiny boxes')
     parser.add_argument("--mot20", dest="mot20", default=False, action="store_true", help="test mot20.")
+
+    # Alert system args
+    parser.add_argument("--alert", action="store_true", default=True, help="enable motion alert system (LOW, MEDIUM, HIGH)")
+    parser.add_argument("--no_alert", dest="alert", action="store_false", help="disable motion alert system")
+    parser.add_argument("--alert_low", type=float, default=20.0, help="speed threshold for LOW alert in px/s (default: 20)")
+    parser.add_argument("--alert_med", type=float, default=60.0, help="speed threshold for MEDIUM alert in px/s (default: 60)")
+    parser.add_argument("--alert_high", type=float, default=120.0, help="speed threshold for HIGH alert in px/s (default: 120)")
+    parser.add_argument("--alert_sound", action="store_true", default=False, help="enable audio beep on HIGH motion alert")
+
+    # ANPR args
+    parser.add_argument("--anpr", action="store_true", default=False, help="enable ANPR (Automatic Number Plate Recognition)")
+    parser.add_argument("--anpr_db", type=str, default="anpr_watchlist.db", help="path to SQLite watchlist database")
+    parser.add_argument("--anpr_workers", type=int, default=1, help="number of async OCR worker threads")
+    parser.add_argument("--anpr_min_area", type=float, default=800.0, help="min vehicle bbox area to trigger ANPR")
+    parser.add_argument("--seed_watchlist", action="store_true", default=False, help="seed database with sample watchlist entries")
+
+    # Routing & Multi-class args
+    parser.add_argument(
+        "--detector_mode",
+        default="single_class_test",
+        choices=["single_class_test", "multi_class_production"],
+        help="Detector routing mode: 'single_class_test' (default MOT17 test) or 'multi_class_production' (class-aware routing)",
+    )
+    parser.add_argument("--num_classes", type=int, default=None, help="override number of model classes")
+    parser.add_argument("--class_names", type=str, default="HUMAN,VEHICLE", help="comma-separated class names for routing")
     return parser
 
 
@@ -175,13 +205,28 @@ class Predictor(object):
         return outputs, img_info
 
 
-def image_demo(predictor, vis_folder, current_time, args):
+def image_demo(predictor, vis_folder, current_time, args, exp):
     if osp.isdir(args.path):
         files = get_image_list(args.path)
     else:
         files = [args.path]
     files.sort()
     tracker = BYTETracker(args, frame_rate=args.fps)
+    if exp.num_classes == 80:
+        class_names = TrackRouter.COCO_CLASSES
+    else:
+        class_names = args.class_names.split(",") if isinstance(args.class_names, str) else args.class_names
+    track_router = TrackRouter(class_names=class_names, default_mode=args.detector_mode)
+
+    anpr_pipeline = ANPRPipeline(
+        db_path=args.anpr_db,
+        min_box_area=args.anpr_min_area,
+        num_workers=args.anpr_workers,
+    ) if args.anpr else None
+
+    if anpr_pipeline and args.seed_watchlist:
+        anpr_pipeline.watchlist_db.seed_sample_watchlist()
+
     timer = Timer()
     results = []
 
@@ -189,25 +234,48 @@ def image_demo(predictor, vis_folder, current_time, args):
         outputs, img_info = predictor.inference(img_path, timer)
         if outputs[0] is not None:
             online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
-            online_tlwhs = []
-            online_ids = []
-            online_scores = []
+            valid_targets = []
             for t in online_targets:
                 tlwh = t.tlwh
                 tid = t.track_id
-                vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
+                vertical = False
+                if args.detector_mode == "single_class_test" and args.aspect_ratio_thresh > 0:
+                    vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
                 if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
-                    online_tlwhs.append(tlwh)
-                    online_ids.append(tid)
-                    online_scores.append(t.score)
+                    valid_targets.append(t)
                     # save results
                     results.append(
                         f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
                     )
             timer.toc()
-            online_im = plot_tracking(
-                img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id, fps=1. / timer.average_time
-            )
+
+            routing_result = track_router.route(valid_targets, detector_mode=args.detector_mode)
+            anpr_results = None
+            if anpr_pipeline is not None:
+                veh_tlwhs = [t.tlwh for t in routing_result.vehicle_tracks]
+                veh_ids = [t.track_id for t in routing_result.vehicle_tracks]
+                veh_scores = [t.score for t in routing_result.vehicle_tracks]
+                anpr_results = anpr_pipeline.process_frame(
+                    img_info['raw_img'], veh_tlwhs, veh_ids, veh_scores, current_time=time.time()
+                )
+
+            if args.detector_mode == DetectorMode.MULTI_CLASS_PRODUCTION:
+                online_im = track_router.draw_unified_overlay(
+                    img_info['raw_img'], routing_result, anpr_results=anpr_results, alert_data=None,
+                    detector_mode=args.detector_mode, frame_id=frame_id, fps=1. / max(1e-5, timer.average_time)
+                )
+            elif anpr_pipeline is not None:
+                all_tlwhs = [t.tlwh for t in valid_targets]
+                all_ids = [t.track_id for t in valid_targets]
+                online_im = ANPRVisualizer.draw_anpr_overlay(
+                    img_info['raw_img'], all_tlwhs, all_ids, anpr_results, frame_id=frame_id, fps=1. / max(1e-5, timer.average_time)
+                )
+            else:
+                all_tlwhs = [t.tlwh for t in valid_targets]
+                all_ids = [t.track_id for t in valid_targets]
+                online_im = plot_tracking(
+                    img_info['raw_img'], all_tlwhs, all_ids, frame_id=frame_id, fps=1. / max(1e-5, timer.average_time)
+                )
         else:
             timer.toc()
             online_im = img_info['raw_img']
@@ -222,10 +290,14 @@ def image_demo(predictor, vis_folder, current_time, args):
         if frame_id % 20 == 0:
             logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
 
+        cv2.imshow("ByteTrack", online_im)
         ch = cv2.waitKey(0)
         if ch == 27 or ch == ord("q") or ch == ord("Q"):
             break
 
+    if anpr_pipeline is not None:
+        anpr_pipeline.stop()
+    cv2.destroyAllWindows()
     if args.save_result:
         res_file = osp.join(vis_folder, f"{timestamp}.txt")
         with open(res_file, 'w') as f:
@@ -233,11 +305,18 @@ def image_demo(predictor, vis_folder, current_time, args):
         logger.info(f"save results to {res_file}")
 
 
-def imageflow_demo(predictor, vis_folder, current_time, args):
+def imageflow_demo(predictor, vis_folder, current_time, args, exp):
     cap = cv2.VideoCapture(args.path if args.demo == "video" else args.camid)
+    if not cap.isOpened():
+        logger.error(f"Could not open {'video ' + args.path if args.demo == 'video' else 'webcam (camid=' + str(args.camid) + ')'}!")
+        return
     width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)  # float
     height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)  # float
+    if args.rotate in (90, 270):
+        width, height = height, width
     fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps == 0 or np.isnan(fps):
+        fps = 30
     timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
     save_folder = osp.join(vis_folder, timestamp)
     os.makedirs(save_folder, exist_ok=True)
@@ -250,6 +329,28 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
         save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(width), int(height))
     )
     tracker = BYTETracker(args, frame_rate=30)
+    if exp.num_classes == 80:
+        class_names = TrackRouter.COCO_CLASSES
+    else:
+        class_names = args.class_names.split(",") if isinstance(args.class_names, str) else args.class_names
+    track_router = TrackRouter(class_names=class_names, default_mode=args.detector_mode)
+
+    alert_system = MotionAlertSystem(
+        low_thresh=args.alert_low,
+        med_thresh=args.alert_med,
+        high_thresh=args.alert_high,
+        enable_sound=args.alert_sound,
+    ) if (args.alert and (args.detector_mode == "multi_class_production" or not args.anpr)) else None
+
+    anpr_pipeline = ANPRPipeline(
+        db_path=args.anpr_db,
+        min_box_area=args.anpr_min_area,
+        num_workers=args.anpr_workers,
+    ) if args.anpr else None
+
+    if anpr_pipeline and args.seed_watchlist:
+        anpr_pipeline.watchlist_db.seed_sample_watchlist()
+
     timer = Timer()
     frame_id = 0
     results = []
@@ -258,38 +359,114 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
             logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
         ret_val, frame = cap.read()
         if ret_val:
+            if args.rotate == 180:
+                frame = cv2.rotate(frame, cv2.ROTATE_180)
+            elif args.rotate == 90:
+                frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+            elif args.rotate == 270:
+                frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
             outputs, img_info = predictor.inference(frame, timer)
             if outputs[0] is not None:
                 online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
-                online_tlwhs = []
-                online_ids = []
-                online_scores = []
+                valid_targets = []
                 for t in online_targets:
                     tlwh = t.tlwh
                     tid = t.track_id
-                    vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
+                    vertical = False
+                    if args.detector_mode == "single_class_test" and args.aspect_ratio_thresh > 0:
+                        vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
                     if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
-                        online_tlwhs.append(tlwh)
-                        online_ids.append(tid)
-                        online_scores.append(t.score)
+                        valid_targets.append(t)
                         results.append(
                             f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
                         )
                 timer.toc()
-                online_im = plot_tracking(
-                    img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id + 1, fps=1. / timer.average_time
-                )
+
+                # Class-Aware Routing
+                routing_result = track_router.route(valid_targets, detector_mode=args.detector_mode)
+                anpr_results = None
+                alert_data = None
+
+                if anpr_pipeline is not None:
+                    veh_tlwhs = [t.tlwh for t in routing_result.vehicle_tracks]
+                    veh_ids = [t.track_id for t in routing_result.vehicle_tracks]
+                    veh_scores = [t.score for t in routing_result.vehicle_tracks]
+                    anpr_results = anpr_pipeline.process_frame(
+                        img_info['raw_img'], veh_tlwhs, veh_ids, veh_scores, current_time=time.time()
+                    )
+
+                if alert_system is not None:
+                    hum_tlwhs = [t.tlwh for t in routing_result.human_tracks]
+                    hum_ids = [t.track_id for t in routing_result.human_tracks]
+                    alert_data = alert_system.update(hum_tlwhs, hum_ids, current_time=time.time())
+
+                # Render unified or legacy output
+                if args.detector_mode == DetectorMode.MULTI_CLASS_PRODUCTION:
+                    online_im = track_router.draw_unified_overlay(
+                        img_info['raw_img'], routing_result, anpr_results=anpr_results, alert_data=alert_data,
+                        detector_mode=args.detector_mode, frame_id=frame_id + 1, fps=1. / max(1e-5, timer.average_time)
+                    )
+                elif anpr_pipeline is not None:
+                    all_tlwhs = [t.tlwh for t in valid_targets]
+                    all_ids = [t.track_id for t in valid_targets]
+                    online_im = ANPRVisualizer.draw_anpr_overlay(
+                        img_info['raw_img'], all_tlwhs, all_ids, anpr_results, frame_id=frame_id + 1, fps=1. / max(1e-5, timer.average_time)
+                    )
+                elif alert_system is not None:
+                    all_tlwhs = [t.tlwh for t in valid_targets]
+                    all_ids = [t.track_id for t in valid_targets]
+                    online_im = alert_system.draw_alerts(
+                        img_info['raw_img'], all_tlwhs, all_ids, alert_data, frame_id=frame_id + 1, fps=1. / max(1e-5, timer.average_time)
+                    )
+                else:
+                    all_tlwhs = [t.tlwh for t in valid_targets]
+                    all_ids = [t.track_id for t in valid_targets]
+                    online_im = plot_tracking(
+                        img_info['raw_img'], all_tlwhs, all_ids, frame_id=frame_id + 1, fps=1. / max(1e-5, timer.average_time)
+                    )
             else:
                 timer.toc()
-                online_im = img_info['raw_img']
+                routing_result = track_router.route([], detector_mode=args.detector_mode)
+                anpr_results = None
+                alert_data = None
+                if anpr_pipeline is not None:
+                    anpr_results = anpr_pipeline.process_frame(
+                        img_info['raw_img'], [], [], [], current_time=time.time()
+                    )
+                if alert_system is not None:
+                    alert_data = alert_system.update([], [], current_time=time.time())
+
+                if args.detector_mode == DetectorMode.MULTI_CLASS_PRODUCTION:
+                    online_im = track_router.draw_unified_overlay(
+                        img_info['raw_img'], routing_result, anpr_results=anpr_results, alert_data=alert_data,
+                        detector_mode=args.detector_mode, frame_id=frame_id + 1, fps=1. / max(1e-5, timer.average_time)
+                    )
+                elif anpr_pipeline is not None:
+                    online_im = ANPRVisualizer.draw_anpr_overlay(
+                        img_info['raw_img'], [], [], anpr_results, frame_id=frame_id + 1, fps=1. / max(1e-5, timer.average_time)
+                    )
+                elif alert_system is not None:
+                    online_im = alert_system.draw_alerts(
+                        img_info['raw_img'], [], [], alert_data, frame_id=frame_id + 1, fps=1. / max(1e-5, timer.average_time)
+                    )
+                else:
+                    online_im = img_info['raw_img']
             if args.save_result:
                 vid_writer.write(online_im)
+            cv2.imshow("ByteTrack", online_im)
             ch = cv2.waitKey(1)
             if ch == 27 or ch == ord("q") or ch == ord("Q"):
                 break
         else:
             break
         frame_id += 1
+
+    if anpr_pipeline is not None:
+        anpr_pipeline.stop()
+    cap.release()
+    if args.save_result:
+        vid_writer.release()
+    cv2.destroyAllWindows()
 
     if args.save_result:
         res_file = osp.join(vis_folder, f"{timestamp}.txt")
@@ -305,8 +482,8 @@ def main(exp, args):
     output_dir = osp.join(exp.output_dir, args.experiment_name)
     os.makedirs(output_dir, exist_ok=True)
 
+    vis_folder = osp.join(output_dir, "track_vis")
     if args.save_result:
-        vis_folder = osp.join(output_dir, "track_vis")
         os.makedirs(vis_folder, exist_ok=True)
 
     if args.trt:
@@ -315,8 +492,12 @@ def main(exp, args):
 
     logger.info("Args: {}".format(args))
 
+    if args.num_classes is not None:
+        exp.num_classes = args.num_classes
     if args.conf is not None:
         exp.test_conf = args.conf
+    elif exp.test_conf < 0.01:
+        exp.test_conf = 0.1  # Default production confidence threshold
     if args.nms is not None:
         exp.nmsthre = args.nms
     if args.tsize is not None:
@@ -331,10 +512,51 @@ def main(exp, args):
             ckpt_file = osp.join(output_dir, "best_ckpt.pth.tar")
         else:
             ckpt_file = args.ckpt
-        logger.info("loading checkpoint")
+        logger.info(f"loading checkpoint: {ckpt_file}")
         ckpt = torch.load(ckpt_file, map_location="cpu")
-        # load the model state dict
-        model.load_state_dict(ckpt["model"])
+        ckpt_state_dict = ckpt["model"] if "model" in ckpt else ckpt
+        model_state_dict = model.state_dict()
+
+        # Adapt class prediction layers if checkpoint num_classes differs from model num_classes
+        for k in list(ckpt_state_dict.keys()):
+            if k in model_state_dict:
+                v_ckpt = ckpt_state_dict[k]
+                v_model = model_state_dict[k]
+                if v_ckpt.shape != v_model.shape:
+                    logger.warning(
+                        f"Adapting weight layer '{k}' from checkpoint shape {list(v_ckpt.shape)} to model shape {list(v_model.shape)}"
+                    )
+                    adapted = v_model.clone()
+                    if len(v_ckpt.shape) == 4 and v_ckpt.shape[1:] == v_model.shape[1:]:
+                        if v_ckpt.shape[0] == 80 and v_model.shape[0] == 2:
+                            # COCO 80-class mapping:
+                            # 0: person -> HUMAN (class 0)
+                            # 1: bicycle, 2: car, 3: motorcycle, 5: bus, 7: truck -> VEHICLE (class 1)
+                            adapted[0] = v_ckpt[0]
+                            adapted[1] = v_ckpt[[1, 2, 3, 5, 7]].mean(dim=0)
+                            logger.info(f"Mapped COCO 80-class layer '{k}' to [HUMAN, VEHICLE]")
+                        elif v_ckpt.shape[0] == 1 and v_model.shape[0] == 2:
+                            adapted[0] = v_ckpt[0]          # Class 0: HUMAN gets full MOT17 pedestrian detector weights
+                            adapted[1] = v_ckpt[0] * 0.01   # Class 1: VEHICLE lower baseline until fine-tuned
+                        else:
+                            min_classes = min(v_ckpt.shape[0], v_model.shape[0])
+                            adapted[:min_classes] = v_ckpt[:min_classes]
+                        ckpt_state_dict[k] = adapted
+                    elif len(v_ckpt.shape) == 1:
+                        if v_ckpt.shape[0] == 80 and v_model.shape[0] == 2:
+                            adapted[0] = v_ckpt[0]
+                            adapted[1] = v_ckpt[[1, 2, 3, 5, 7]].mean(dim=0)
+                        elif v_ckpt.shape[0] == 1 and v_model.shape[0] == 2:
+                            adapted[0] = v_ckpt[0]
+                            adapted[1] = v_ckpt[0] - 3.0    # Class 1: lower logit bias
+                        else:
+                            min_classes = min(v_ckpt.shape[0], v_model.shape[0])
+                            adapted[:min_classes] = v_ckpt[:min_classes]
+                        ckpt_state_dict[k] = adapted
+                    else:
+                        del ckpt_state_dict[k]
+
+        model.load_state_dict(ckpt_state_dict, strict=False)
         logger.info("loaded checkpoint done.")
 
     if args.fuse:
@@ -360,9 +582,9 @@ def main(exp, args):
     predictor = Predictor(model, exp, trt_file, decoder, args.device, args.fp16)
     current_time = time.localtime()
     if args.demo == "image":
-        image_demo(predictor, vis_folder, current_time, args)
+        image_demo(predictor, vis_folder, current_time, args, exp)
     elif args.demo == "video" or args.demo == "webcam":
-        imageflow_demo(predictor, vis_folder, current_time, args)
+        imageflow_demo(predictor, vis_folder, current_time, args, exp)
 
 
 if __name__ == "__main__":
