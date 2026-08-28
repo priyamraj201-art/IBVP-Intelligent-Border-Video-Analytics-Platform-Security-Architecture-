@@ -117,6 +117,13 @@ def make_parser():
     )
     parser.add_argument("--num_classes", type=int, default=None, help="override number of model classes")
     parser.add_argument("--class_names", type=str, default="HUMAN,VEHICLE", help="comma-separated class names for routing")
+
+    # Dual-Model Ensemble args (MOT17 Human SOTA + COCO Vehicles + ANPR)
+    parser.add_argument("--ensemble", action="store_true", default=False, help="enable Dual-Model Ensemble: MOT17 model for human SOTA + COCO model for vehicles + ANPR")
+    parser.add_argument("--human_exp", type=str, default="exps/example/mot/yolox_x_mix_det.py", help="exp file for human detector")
+    parser.add_argument("--human_ckpt", type=str, default="pretrained/bytetrack_x_mot17.pth.tar", help="checkpoint for human detector")
+    parser.add_argument("--vehicle_exp", type=str, default="exps/default/yolox_x.py", help="exp file for vehicle detector")
+    parser.add_argument("--vehicle_ckpt", type=str, default="pretrained/yolox_x.pth", help="checkpoint for vehicle detector")
     return parser
 
 
@@ -203,6 +210,91 @@ class Predictor(object):
             )
             #logger.info("Infer time: {:.4f}s".format(time.time() - t0))
         return outputs, img_info
+
+
+class DualPredictor(object):
+    """
+    Dual-Model Ensemble Predictor:
+    - MOT17/CrowdHuman model for highest-efficiency human detection (Class 0: HUMAN)
+    - COCO model (YOLOX-X or YOLOX-S) for full vehicle detection + ANPR (Class 1: VEHICLE)
+    """
+    def __init__(
+        self,
+        human_model,
+        human_exp,
+        vehicle_model,
+        vehicle_exp,
+        device=torch.device("cpu"),
+        fp16=False,
+    ):
+        self.human_model = human_model
+        self.human_exp = human_exp
+        self.vehicle_model = vehicle_model
+        self.vehicle_exp = vehicle_exp
+        self.device = device
+        self.fp16 = fp16
+        self.rgb_means = (0.485, 0.456, 0.406)
+        self.std = (0.229, 0.224, 0.225)
+        self.test_size = human_exp.test_size
+        self.num_classes = 2
+
+    def inference(self, img, timer):
+        img_info = {"id": 0}
+        if isinstance(img, str):
+            img_info["file_name"] = osp.basename(img)
+            img = cv2.imread(img)
+        else:
+            img_info["file_name"] = None
+
+        height, width = img.shape[:2]
+        img_info["height"] = height
+        img_info["width"] = width
+        img_info["raw_img"] = img
+
+        with torch.no_grad():
+            timer.tic()
+            # 1. Human Model Inference (MOT17/CrowdHuman specialized weights)
+            img_h, ratio_h = preproc(img, self.human_exp.test_size, self.rgb_means, self.std)
+            img_info["ratio"] = ratio_h
+            t_h = torch.from_numpy(img_h).unsqueeze(0).float().to(self.device)
+            if self.fp16:
+                t_h = t_h.half()
+            out_h = self.human_model(t_h)
+            out_h = postprocess(out_h, self.human_exp.num_classes, self.human_exp.test_conf, self.human_exp.nmsthre)[0]
+
+            if out_h is not None and out_h.shape[0] > 0:
+                out_h[:, 6] = 0.0  # Force Class 0: HUMAN
+
+            # 2. Vehicle Model Inference (COCO weights)
+            img_v, ratio_v = preproc(img, self.vehicle_exp.test_size, self.rgb_means, self.std)
+            t_v = torch.from_numpy(img_v).unsqueeze(0).float().to(self.device)
+            if self.fp16:
+                t_v = t_v.half()
+            out_v = self.vehicle_model(t_v)
+            out_v = postprocess(out_v, self.vehicle_exp.num_classes, self.vehicle_exp.test_conf, self.vehicle_exp.nmsthre)[0]
+
+            if out_v is not None and out_v.shape[0] > 0:
+                # 1: bicycle, 2: car, 3: motorcycle, 5: bus, 7: truck
+                veh_mask = torch.isin(out_v[:, 6], torch.tensor([1.0, 2.0, 3.0, 5.0, 7.0], device=self.device))
+                out_v = out_v[veh_mask]
+                if out_v.shape[0] > 0:
+                    if ratio_v != ratio_h:
+                        out_v[:, :4] = out_v[:, :4] * (ratio_h / ratio_v)
+                    out_v[:, 6] = 1.0  # Force Class 1: VEHICLE
+                else:
+                    out_v = None
+
+            # 3. Fuse Detections
+            if out_h is not None and out_v is not None:
+                fused = torch.cat([out_h, out_v], dim=0)
+            elif out_h is not None:
+                fused = out_h
+            elif out_v is not None:
+                fused = out_v
+            else:
+                fused = None
+
+        return [fused], img_info
 
 
 def image_demo(predictor, vis_folder, current_time, args, exp):
@@ -492,6 +584,47 @@ def main(exp, args):
 
     logger.info("Args: {}".format(args))
 
+    if args.ensemble:
+        logger.info("==================================================================")
+        logger.info("INITIALIZING DUAL-MODEL ENSEMBLE:")
+        logger.info(f" -> Human Detector (SOTA MOT17): {args.human_ckpt} ({args.human_exp})")
+        logger.info(f" -> Vehicle Detector (COCO):     {args.vehicle_ckpt} ({args.vehicle_exp})")
+        logger.info("==================================================================")
+
+        human_exp = get_exp(args.human_exp, None)
+        if args.conf is not None:
+            human_exp.test_conf = args.conf
+        human_model = human_exp.get_model().to(args.device)
+        ckpt_h = torch.load(args.human_ckpt, map_location="cpu")
+        human_model.load_state_dict(ckpt_h["model"] if "model" in ckpt_h else ckpt_h)
+        human_model.eval()
+
+        vehicle_exp = get_exp(args.vehicle_exp, None)
+        vehicle_exp.test_conf = 0.1 if args.conf is None else args.conf
+        vehicle_model = vehicle_exp.get_model().to(args.device)
+        ckpt_v = torch.load(args.vehicle_ckpt, map_location="cpu")
+        vehicle_model.load_state_dict(ckpt_v["model"] if "model" in ckpt_v else ckpt_v)
+        vehicle_model.eval()
+
+        if args.fuse:
+            human_model = fuse_model(human_model)
+            vehicle_model = fuse_model(vehicle_model)
+        if args.fp16:
+            human_model = human_model.half()
+            vehicle_model = vehicle_model.half()
+
+        predictor = DualPredictor(human_model, human_exp, vehicle_model, vehicle_exp, args.device, args.fp16)
+        current_time = time.localtime()
+        exp.test_size = human_exp.test_size
+        exp.num_classes = 2
+        args.detector_mode = "multi_class_production"
+        args.class_names = "HUMAN,VEHICLE"
+        if args.demo == "image":
+            image_demo(predictor, vis_folder, current_time, args, exp)
+        elif args.demo == "video" or args.demo == "webcam":
+            imageflow_demo(predictor, vis_folder, current_time, args, exp)
+        return
+
     if args.num_classes is not None:
         exp.num_classes = args.num_classes
     if args.conf is not None:
@@ -589,6 +722,8 @@ def main(exp, args):
 
 if __name__ == "__main__":
     args = make_parser().parse_args()
+    if args.ensemble and args.exp_file is None:
+        args.exp_file = args.human_exp
     exp = get_exp(args.exp_file, args.name)
 
     main(exp, args)
