@@ -1,10 +1,18 @@
 import argparse
 import os
 import os.path as osp
+import sys
+
+# Prevent OpenMP runtime collision on Windows
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import time
 import cv2
 import numpy as np
 import torch
+
+# Ensure repository root is in sys.path
+sys.path.insert(0, osp.abspath(osp.join(osp.dirname(__file__), "..")))
 
 from loguru import logger
 
@@ -15,6 +23,7 @@ from yolox.utils.visualize import plot_tracking
 from yolox.tracker.byte_tracker import BYTETracker
 from yolox.tracker.alert_system import MotionAlertSystem
 from yolox.anpr import ANPRPipeline, ANPRVisualizer
+from yolox.frs import FRSPipeline, FRSVisualizer
 from yolox.routing import TrackRouter, DetectorMode
 from yolox.tracking_utils.timer import Timer
 
@@ -107,6 +116,15 @@ def make_parser():
     parser.add_argument("--anpr_workers", type=int, default=1, help="number of async OCR worker threads")
     parser.add_argument("--anpr_min_area", type=float, default=800.0, help="min vehicle bbox area to trigger ANPR")
     parser.add_argument("--seed_watchlist", action="store_true", default=False, help="seed database with sample watchlist entries")
+
+    # FRS args
+    parser.add_argument("--frs", action="store_true", default=False, help="enable Facial Recognition System")
+    parser.add_argument("--frs_db", type=str, default="frs_faces.db", help="path to FRS SQLite face database")
+    parser.add_argument("--frs_workers", type=int, default=1, help="number of async FRS worker threads")
+    parser.add_argument("--frs_min_area", type=float, default=1500.0, help="min human bbox area to trigger FRS")
+    parser.add_argument("--frs_threshold", type=float, default=0.45, help="cosine similarity threshold for face match")
+    parser.add_argument("--seed_faces", action="store_true", default=False, help="seed FRS database with sample watchlist identities")
+    parser.add_argument("--detect_skip", type=int, default=1, help="run detector every N frames for CPU speedup (e.g. 3 = 3x faster display). Tracking interpolates between detections.")
 
     # Routing & Multi-class args
     parser.add_argument(
@@ -319,6 +337,16 @@ def image_demo(predictor, vis_folder, current_time, args, exp):
     if anpr_pipeline and args.seed_watchlist:
         anpr_pipeline.watchlist_db.seed_sample_watchlist()
 
+    frs_pipeline = FRSPipeline(
+        db_path=args.frs_db,
+        min_box_area=args.frs_min_area,
+        num_workers=args.frs_workers,
+        match_threshold=args.frs_threshold,
+    ) if args.frs else None
+
+    if frs_pipeline and args.seed_faces:
+        frs_pipeline.face_db.seed_sample_identities()
+
     timer = Timer()
     results = []
 
@@ -343,6 +371,8 @@ def image_demo(predictor, vis_folder, current_time, args, exp):
 
             routing_result = track_router.route(valid_targets, detector_mode=args.detector_mode)
             anpr_results = None
+            frs_results = None
+
             if anpr_pipeline is not None:
                 veh_tlwhs = [t.tlwh for t in routing_result.vehicle_tracks]
                 veh_ids = [t.track_id for t in routing_result.vehicle_tracks]
@@ -351,10 +381,24 @@ def image_demo(predictor, vis_folder, current_time, args, exp):
                     img_info['raw_img'], veh_tlwhs, veh_ids, veh_scores, current_time=time.time()
                 )
 
+            if frs_pipeline is not None:
+                hum_tlwhs = [t.tlwh for t in routing_result.human_tracks]
+                hum_ids = [t.track_id for t in routing_result.human_tracks]
+                hum_scores = [t.score for t in routing_result.human_tracks]
+                frs_results = frs_pipeline.process_frame(
+                    img_info['raw_img'], hum_tlwhs, hum_ids, hum_scores, current_time=time.time()
+                )
+
             if args.detector_mode == DetectorMode.MULTI_CLASS_PRODUCTION:
                 online_im = track_router.draw_unified_overlay(
-                    img_info['raw_img'], routing_result, anpr_results=anpr_results, alert_data=None,
+                    img_info['raw_img'], routing_result, anpr_results=anpr_results, alert_data=None, frs_results=frs_results,
                     detector_mode=args.detector_mode, frame_id=frame_id, fps=1. / max(1e-5, timer.average_time)
+                )
+            elif frs_pipeline is not None and anpr_pipeline is None:
+                all_tlwhs = [t.tlwh for t in valid_targets]
+                all_ids = [t.track_id for t in valid_targets]
+                online_im = FRSVisualizer.draw_frs_overlay(
+                    img_info['raw_img'], all_tlwhs, all_ids, frs_results, frame_id=frame_id, fps=1. / max(1e-5, timer.average_time)
                 )
             elif anpr_pipeline is not None:
                 all_tlwhs = [t.tlwh for t in valid_targets]
@@ -389,6 +433,8 @@ def image_demo(predictor, vis_folder, current_time, args, exp):
 
     if anpr_pipeline is not None:
         anpr_pipeline.stop()
+    if frs_pipeline is not None:
+        frs_pipeline.stop()
     cv2.destroyAllWindows()
     if args.save_result:
         res_file = osp.join(vis_folder, f"{timestamp}.txt")
@@ -432,7 +478,7 @@ def imageflow_demo(predictor, vis_folder, current_time, args, exp):
         med_thresh=args.alert_med,
         high_thresh=args.alert_high,
         enable_sound=args.alert_sound,
-    ) if (args.alert and (args.detector_mode == "multi_class_production" or not args.anpr)) else None
+    ) if (args.alert and (args.detector_mode == "multi_class_production" or not (args.anpr or args.frs))) else None
 
     anpr_pipeline = ANPRPipeline(
         db_path=args.anpr_db,
@@ -443,9 +489,107 @@ def imageflow_demo(predictor, vis_folder, current_time, args, exp):
     if anpr_pipeline and args.seed_watchlist:
         anpr_pipeline.watchlist_db.seed_sample_watchlist()
 
+    frs_pipeline = FRSPipeline(
+        db_path=args.frs_db,
+        min_box_area=args.frs_min_area,
+        num_workers=args.frs_workers,
+        match_threshold=args.frs_threshold,
+    ) if args.frs else None
+
+    if frs_pipeline and args.seed_faces:
+        frs_pipeline.face_db.seed_sample_identities()
+
     timer = Timer()
     frame_id = 0
     results = []
+    detect_skip = max(1, getattr(args, 'detect_skip', 1))
+    # State carried across skipped frames
+    _last_outputs = None
+    _last_img_info = None
+    _last_valid_targets = []
+    _last_routing_result = None
+    _last_frs_results = None
+    _last_anpr_results = None
+    _last_alert_data = None
+    _last_online_im = None
+
+    def _enroll_face_interactive(raw_frame, valid_targets, frs_pipeline):
+        """Pause and enroll the largest detected face into FRS database interactively."""
+        if frs_pipeline is None:
+            logger.warning("FRS not enabled. Run with --frs to enable face enrollment.")
+            return
+        # Find largest bounding box among valid targets
+        best_t = None
+        best_area = 0
+        for t in valid_targets:
+            area = t.tlwh[2] * t.tlwh[3]
+            if area > best_area:
+                best_area = area
+                best_t = t
+        if best_t is None:
+            logger.warning("No tracked person in frame to enroll. Move closer to camera.")
+            return
+        # Crop the person region
+        x, y, w, h = [int(v) for v in best_t.tlwh]
+        x2, y2 = min(x + w, raw_frame.shape[1]), min(y + h, raw_frame.shape[0])
+        x = max(0, x); y = max(0, y)
+        crop = raw_frame[y:y2, x:x2]
+        if crop.size == 0:
+            logger.warning("Empty crop, could not enroll.")
+            return
+        # Show enrollment preview in a separate window
+        preview = crop.copy()
+        cv2.putText(preview, "ENROLLING THIS FACE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.imshow("FRS Enrollment Preview", preview)
+        cv2.waitKey(500)
+        cv2.destroyWindow("FRS Enrollment Preview")
+        # Console prompt (non-blocking - printed to terminal)
+        print("\n" + "="*60)
+        print("  FRS LIVE ENROLLMENT")
+        print("="*60)
+        print("  Track ID  :", best_t.track_id)
+        print("  Bbox area :", int(best_area), "px²")
+        print("-"*60)
+        person_id = input("  Enter Person ID (e.g. STAFF_001) [blank=cancel]: ").strip()
+        if not person_id:
+            print("  [Cancelled]")
+            print("="*60)
+            return
+        full_name = input("  Enter Full Name (e.g. Arjun Sharma): ").strip() or person_id
+        category = input("  Category [STAFF/VIP/SUSPECT/WANTED/UNKNOWN] (default STAFF): ").strip().upper() or "STAFF"
+        notes = input("  Notes (optional): ").strip()
+        enrolled_by = "live_webcam"
+        # Extract embedding via FRS pipeline embedder (ArcFace)
+        detector = frs_pipeline.detector
+        embedder = frs_pipeline.embedder
+        best_face = detector.get_best_face(crop)
+        if best_face is None:
+            logger.warning("No face detected in the person crop. Try again with a clearer view of the face.")
+            print("  [FAILED] No face detected in crop.")
+            print("="*60)
+            return
+        face_crop, score = best_face
+        emb, quality = embedder.get_embedding(face_crop)
+        if emb is None:
+            logger.warning("Could not extract face embedding.")
+            print("  [FAILED] Could not extract embedding.")
+            print("="*60)
+            return
+        obs_id = frs_pipeline.face_db.enroll_face(
+            person_id=person_id,
+            name=full_name,
+            embedding=emb,
+            category=category,
+            enrolled_by=enrolled_by,
+            notes=notes,
+        )
+        if obs_id:
+            print(f"  [SUCCESS] Enrolled '{full_name}' ({person_id}) as {category}")
+            logger.info(f"Live enrolled: {full_name} ({person_id}) category={category}")
+        else:
+            print("  [FAILED] Enrollment failed. Check logs.")
+        print("="*60)
+
     while True:
         if frame_id % 20 == 0:
             logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
@@ -457,27 +601,49 @@ def imageflow_demo(predictor, vis_folder, current_time, args, exp):
                 frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
             elif args.rotate == 270:
                 frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-            outputs, img_info = predictor.inference(frame, timer)
-            if outputs[0] is not None:
-                online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
-                valid_targets = []
-                for t in online_targets:
-                    tlwh = t.tlwh
-                    tid = t.track_id
-                    vertical = False
-                    if args.detector_mode == "single_class_test" and args.aspect_ratio_thresh > 0:
-                        vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
-                    if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
-                        valid_targets.append(t)
-                        results.append(
-                            f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
-                        )
-                timer.toc()
+
+            # --- Frame-skip: only run detector every detect_skip frames ---
+            run_detection = (frame_id % detect_skip == 0)
+
+            if run_detection:
+                timer.tic()
+                outputs, img_info = predictor.inference(frame, timer)
+                _last_outputs = outputs
+                _last_img_info = img_info
+            else:
+                # Reuse last detection result with fresh raw frame for display
+                outputs = _last_outputs
+                if _last_img_info is not None:
+                    img_info = dict(_last_img_info)
+                    img_info['raw_img'] = frame
+                else:
+                    img_info = {'raw_img': frame, 'height': frame.shape[0], 'width': frame.shape[1]}
+
+            if outputs is not None and outputs[0] is not None:
+                if run_detection:
+                    online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
+                    valid_targets = []
+                    for t in online_targets:
+                        tlwh = t.tlwh
+                        tid = t.track_id
+                        vertical = False
+                        if args.detector_mode == "single_class_test" and args.aspect_ratio_thresh > 0:
+                            vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
+                        if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
+                            valid_targets.append(t)
+                            results.append(
+                                f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
+                            )
+                    _last_valid_targets = valid_targets
+                    timer.toc()
+                else:
+                    valid_targets = _last_valid_targets
 
                 # Class-Aware Routing
                 routing_result = track_router.route(valid_targets, detector_mode=args.detector_mode)
                 anpr_results = None
                 alert_data = None
+                frs_results = None
 
                 if anpr_pipeline is not None:
                     veh_tlwhs = [t.tlwh for t in routing_result.vehicle_tracks]
@@ -492,11 +658,29 @@ def imageflow_demo(predictor, vis_folder, current_time, args, exp):
                     hum_ids = [t.track_id for t in routing_result.human_tracks]
                     alert_data = alert_system.update(hum_tlwhs, hum_ids, current_time=time.time())
 
-                # Render unified or legacy output
+                if frs_pipeline is not None:
+                    hum_tlwhs = [t.tlwh for t in routing_result.human_tracks]
+                    hum_ids = [t.track_id for t in routing_result.human_tracks]
+                    hum_scores = [t.score for t in routing_result.human_tracks]
+                    frs_results = frs_pipeline.process_frame(
+                        img_info['raw_img'], hum_tlwhs, hum_ids, hum_scores, current_time=time.time()
+                    )
+                _last_routing_result = routing_result
+                _last_frs_results = frs_results
+                _last_anpr_results = anpr_results
+                _last_alert_data = alert_data
+
+                # Render unified or specialized output
                 if args.detector_mode == DetectorMode.MULTI_CLASS_PRODUCTION:
                     online_im = track_router.draw_unified_overlay(
-                        img_info['raw_img'], routing_result, anpr_results=anpr_results, alert_data=alert_data,
+                        img_info['raw_img'], routing_result, anpr_results=anpr_results, alert_data=alert_data, frs_results=frs_results,
                         detector_mode=args.detector_mode, frame_id=frame_id + 1, fps=1. / max(1e-5, timer.average_time)
+                    )
+                elif frs_pipeline is not None and anpr_pipeline is None:
+                    all_tlwhs = [t.tlwh for t in valid_targets]
+                    all_ids = [t.track_id for t in valid_targets]
+                    online_im = FRSVisualizer.draw_frs_overlay(
+                        img_info['raw_img'], all_tlwhs, all_ids, frs_results, frame_id=frame_id + 1, fps=1. / max(1e-5, timer.average_time)
                     )
                 elif anpr_pipeline is not None:
                     all_tlwhs = [t.tlwh for t in valid_targets]
@@ -517,21 +701,31 @@ def imageflow_demo(predictor, vis_folder, current_time, args, exp):
                         img_info['raw_img'], all_tlwhs, all_ids, frame_id=frame_id + 1, fps=1. / max(1e-5, timer.average_time)
                     )
             else:
-                timer.toc()
+                if run_detection:
+                    timer.toc()
                 routing_result = track_router.route([], detector_mode=args.detector_mode)
                 anpr_results = None
                 alert_data = None
+                frs_results = None
                 if anpr_pipeline is not None:
                     anpr_results = anpr_pipeline.process_frame(
                         img_info['raw_img'], [], [], [], current_time=time.time()
                     )
                 if alert_system is not None:
                     alert_data = alert_system.update([], [], current_time=time.time())
+                if frs_pipeline is not None:
+                    frs_results = frs_pipeline.process_frame(
+                        img_info['raw_img'], [], [], [], current_time=time.time()
+                    )
 
                 if args.detector_mode == DetectorMode.MULTI_CLASS_PRODUCTION:
                     online_im = track_router.draw_unified_overlay(
-                        img_info['raw_img'], routing_result, anpr_results=anpr_results, alert_data=alert_data,
+                        img_info['raw_img'], routing_result, anpr_results=anpr_results, alert_data=alert_data, frs_results=frs_results,
                         detector_mode=args.detector_mode, frame_id=frame_id + 1, fps=1. / max(1e-5, timer.average_time)
+                    )
+                elif frs_pipeline is not None and anpr_pipeline is None:
+                    online_im = FRSVisualizer.draw_frs_overlay(
+                        img_info['raw_img'], [], [], frs_results, frame_id=frame_id + 1, fps=1. / max(1e-5, timer.average_time)
                     )
                 elif anpr_pipeline is not None:
                     online_im = ANPRVisualizer.draw_anpr_overlay(
@@ -543,18 +737,33 @@ def imageflow_demo(predictor, vis_folder, current_time, args, exp):
                     )
                 else:
                     online_im = img_info['raw_img']
+
+            # Overlay enrollment hint if FRS enabled (webcam only)
+            if frs_pipeline is not None and args.demo in ("webcam",):
+                hint = "Press [E] to enroll face | [Q] to quit"
+                cv2.putText(online_im, hint, (10, online_im.shape[0] - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 255, 180), 1, cv2.LINE_AA)
+
+            _last_online_im = online_im
             if args.save_result:
                 vid_writer.write(online_im)
             cv2.imshow("ByteTrack", online_im)
             ch = cv2.waitKey(1)
             if ch == 27 or ch == ord("q") or ch == ord("Q"):
                 break
+            elif ch == ord("e") or ch == ord("E"):
+                # Live face enrollment - pause display, prompt in terminal
+                if _last_img_info is not None:
+                    _raw = frame.copy()
+                    _enroll_face_interactive(_raw, _last_valid_targets, frs_pipeline)
         else:
             break
         frame_id += 1
 
     if anpr_pipeline is not None:
         anpr_pipeline.stop()
+    if frs_pipeline is not None:
+        frs_pipeline.stop()
     cap.release()
     if args.save_result:
         vid_writer.release()
@@ -580,7 +789,18 @@ def main(exp, args):
 
     if args.trt:
         args.device = "gpu"
-    args.device = torch.device("cuda" if args.device == "gpu" else "cpu")
+
+    # Auto-detect CUDA availability
+    if args.device == "gpu":
+        if torch.cuda.is_available():
+            args.device = torch.device("cuda")
+        else:
+            logger.warning("CUDA is not available or torch was not compiled with CUDA. Falling back to CPU.")
+            args.device = torch.device("cpu")
+            args.fp16 = False
+    else:
+        args.device = torch.device("cpu")
+        args.fp16 = False
 
     logger.info("Args: {}".format(args))
 

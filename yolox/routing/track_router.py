@@ -137,6 +137,7 @@ class TrackRouter:
         routing_result: RoutingResult,
         anpr_results: Optional[Dict[int, Dict[str, Any]]] = None,
         alert_data: Optional[Dict[int, Dict[str, Any]]] = None,
+        frs_results: Optional[Dict[int, Dict[str, Any]]] = None,
         detector_mode: str = DetectorMode.SINGLE_CLASS_TEST,
         frame_id: int = 0,
         fps: float = 0.0,
@@ -144,49 +145,75 @@ class TrackRouter:
         """
         Render unified visual overlay displaying:
         - License plate badges on VEHICLES
-        - Speed labels and trajectory trails on HUMANS
+        - Speed labels, identity badges, and trajectory trails on HUMANS
         - Top unified status banner showing counts by class
         """
         im = np.ascontiguousarray(np.copy(image))
         im_h, im_w = im.shape[:2]
 
-        # 1. Render Human Tracks (Motion Velocity & Alerts)
-        if alert_data:
-            for track in routing_result.human_tracks:
-                tid = track.track_id
-                tlwh = track.tlwh
-                x1, y1, w, h = map(int, tlwh)
-                x2, y2 = x1 + w, y1 + h
+        # 1. Render Human Tracks (Motion Velocity & Alerts & FRS)
+        for track in routing_result.human_tracks:
+            tid = track.track_id
+            tlwh = track.tlwh
+            x1, y1, w, h = map(int, tlwh)
+            x2, y2 = x1 + w, y1 + h
 
-                info = alert_data.get(tid, {
-                    "level": "NORMAL",
-                    "speed": 0.0,
-                    "color": (0, 220, 0),
-                    "trail": [],
-                })
-                color = info.get("color", (0, 220, 0))
-                trail = info.get("trail", [])
-                level = info.get("level", "NORMAL")
-                speed = info.get("speed", 0.0)
+            info = alert_data.get(tid, {
+                "level": "NORMAL",
+                "speed": 0.0,
+                "color": (0, 220, 0),
+                "trail": [],
+            }) if alert_data else {
+                "level": "NORMAL",
+                "speed": 0.0,
+                "color": (0, 220, 0),
+                "trail": [],
+            }
+            color = info.get("color", (0, 220, 0))
+            trail = info.get("trail", [])
+            level = info.get("level", "NORMAL")
+            speed = info.get("speed", 0.0)
 
-                # Trajectory trail
-                if len(trail) >= 2:
-                    for idx in range(1, len(trail)):
-                        alpha = idx / len(trail)
-                        thickness = max(1, int(3 * alpha))
-                        pt1 = (int(trail[idx - 1][0]), int(trail[idx - 1][1]))
-                        pt2 = (int(trail[idx][0]), int(trail[idx][1]))
-                        cv2.line(im, pt1, pt2, color, thickness)
+            # Check FRS identification
+            face_info = frs_results.get(tid) if frs_results else None
+            is_identified = face_info and face_info.get("person_id") != "UNKNOWN"
+            is_flagged = face_info.get("is_flagged", False) if face_info else False
 
-                # Bounding box
-                cv2.rectangle(im, (x1, y1), (x2, y2), color, 2)
+            if is_flagged:
+                color = (0, 0, 230)  # Red alert for flagged face
+            elif is_identified:
+                cat = face_info.get("category", "NORMAL").upper()
+                if cat == "VIP":
+                    color = (0, 200, 0)
+                elif cat == "STAFF":
+                    color = (200, 200, 0)
 
-                # Human badge
+            # Trajectory trail
+            if len(trail) >= 2:
+                for idx in range(1, len(trail)):
+                    alpha = idx / len(trail)
+                    thickness = max(1, int(3 * alpha))
+                    pt1 = (int(trail[idx - 1][0]), int(trail[idx - 1][1]))
+                    pt2 = (int(trail[idx][0]), int(trail[idx][1]))
+                    cv2.line(im, pt1, pt2, color, thickness)
+
+            # Bounding box
+            box_thick = 3 if is_flagged else 2
+            cv2.rectangle(im, (x1, y1), (x2, y2), color, box_thick)
+
+            # Human badge
+            if is_identified:
+                name = face_info.get("name", "Identified")
+                cat = face_info.get("category", "KNOWN")
+                badge_text = f"[{cat}] {name} | {speed:.0f} px/s [{level}]"
+            else:
                 badge_text = f"HUMAN #{tid} | {speed:.0f} px/s [{level}]"
-                (tw, th), _ = cv2.getTextSize(badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                by1 = max(0, y1 - th - 8)
-                cv2.rectangle(im, (x1, by1), (x1 + tw + 8, y1), color, -1)
-                cv2.putText(im, badge_text, (x1 + 4, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+            (tw, th), _ = cv2.getTextSize(badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            by1 = max(0, y1 - th - 8)
+            cv2.rectangle(im, (x1, by1), (x1 + tw + 8, y1), color, -1)
+            text_col = (255, 255, 255) if is_flagged else (0, 0, 0)
+            cv2.putText(im, badge_text, (x1 + 4, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_col, 1, cv2.LINE_AA)
 
         # 2. Render Vehicle Tracks (ANPR Badges)
         if anpr_results is not None:

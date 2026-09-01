@@ -4,7 +4,10 @@
 
 import torch
 import torch.nn as nn
-from thop import profile
+try:
+    from thop import profile
+except ImportError:
+    profile = None
 
 from copy import deepcopy
 
@@ -17,6 +20,9 @@ __all__ = [
 
 
 def get_model_info(model, tsize):
+    if profile is None:
+        params = sum(p.numel() for p in model.parameters()) / 1e6
+        return "Params: {:.2f}M".format(params)
 
     stride = 64
     img = torch.zeros((1, 3, stride, stride), device=next(model.parameters()).device)
