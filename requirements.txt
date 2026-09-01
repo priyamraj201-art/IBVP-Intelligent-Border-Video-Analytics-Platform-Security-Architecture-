@@ -24,3 +24,9 @@ onnx-simplifier==0.3.5
 # Optional for ANPR (CPU Mobile OCR)
 # paddlepaddle>=2.5.0
 # paddleocr>=2.7.0
+
+# FRS — Face Recognition System
+insightface>=0.7.3
+onnxruntime>=1.16.0       # CPU inference for InsightFace
+faiss-cpu>=1.7.4           # Fast embedding search (use faiss-gpu if CUDA available)
+cryptography>=41.0.0       # AES-256 embedding encryption

@@ -1,9 +1,13 @@
 import cv2
 import numpy as np
 import scipy
-# pyrefly: ignore [missing-import]
-import lap
 from scipy.spatial.distance import cdist
+from scipy.optimize import linear_sum_assignment
+
+try:
+    import lap
+except ImportError:
+    lap = None
 
 try:
     from cython_bbox import bbox_overlaps as bbox_ious
@@ -58,13 +62,24 @@ def linear_assignment(cost_matrix, thresh):
     if cost_matrix.size == 0:
         return np.empty((0, 2), dtype=int), tuple(range(cost_matrix.shape[0])), tuple(range(cost_matrix.shape[1]))
     matches, unmatched_a, unmatched_b = [], [], []
-    cost, x, y = lap.lapjv(cost_matrix, extend_cost=True, cost_limit=thresh)
-    for ix, mx in enumerate(x):
-        if mx >= 0:
-            matches.append([ix, mx])
-    unmatched_a = np.where(x < 0)[0]
-    unmatched_b = np.where(y < 0)[0]
-    matches = np.asarray(matches)
+    if lap is not None:
+        cost, x, y = lap.lapjv(cost_matrix, extend_cost=True, cost_limit=thresh)
+        for ix, mx in enumerate(x):
+            if mx >= 0:
+                matches.append([ix, mx])
+        unmatched_a = np.where(x < 0)[0]
+        unmatched_b = np.where(y < 0)[0]
+        matches = np.asarray(matches)
+    else:
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        for r, c in zip(row_ind, col_ind):
+            if cost_matrix[r, c] <= thresh:
+                matches.append([r, c])
+        matched_a = set(m[0] for m in matches)
+        matched_b = set(m[1] for m in matches)
+        unmatched_a = np.array([i for i in range(cost_matrix.shape[0]) if i not in matched_a])
+        unmatched_b = np.array([j for j in range(cost_matrix.shape[1]) if j not in matched_b])
+        matches = np.asarray(matches) if matches else np.empty((0, 2), dtype=int)
     return matches, unmatched_a, unmatched_b
 
 
