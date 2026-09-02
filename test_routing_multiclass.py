@@ -7,8 +7,11 @@ Automated Test Suite for Multi-Class VEHICLE/HUMAN Detection & Track Routing.
 import os
 import sys
 import json
+# pyrefly: ignore [missing-import]
 import torch
+# pyrefly: ignore [missing-import]
 import numpy as np
+# pyrefly: ignore [missing-import]
 import cv2
 
 # Add root directory to sys.path
