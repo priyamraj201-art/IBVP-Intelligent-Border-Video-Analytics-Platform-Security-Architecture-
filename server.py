@@ -3,8 +3,10 @@ import asyncio
 import json
 import threading
 import time
+import base64
+import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, Form
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -19,10 +21,16 @@ app.add_middleware(
 
 # Global variables
 active_websockets = []
-latest_frame = None
-latest_raw_frame = None
 frs_pipeline_instance = None
 lock = threading.Lock()
+
+capture_lock = threading.Lock()
+node_pending_frames = {} # node_id -> {"frame": np_array, "id": int}
+node_latest_frames = {}  # node_id -> {"bytes": bytes, "version": int}
+node_latest_raw_frames = {} # node_id -> {"bytes": bytes, "version": int}
+global_capture_event = threading.Event()
+active_camera_nodes = set()
+JPEG_ENCODE_PARAMS = [int(cv2.IMWRITE_JPEG_QUALITY), 85]
 
 @app.websocket("/ws/alerts")
 async def websocket_endpoint(websocket: WebSocket):
@@ -55,7 +63,40 @@ def broadcast_alert(alert_data: dict):
         else:
             loop.run_until_complete(_send())
     except RuntimeError:
-        asyncio.run(_send())
+        pass
+
+@app.websocket("/ws/camera/{node_id}")
+async def camera_websocket(websocket: WebSocket, node_id: str):
+    await websocket.accept()
+    active_camera_nodes.add(node_id)
+    frame_id_counter = 0
+    try:
+        while True:
+            data = await websocket.receive_text()
+            if data.startswith("data:image"):
+                base64_data = data.split(",")[1]
+            else:
+                base64_data = data
+            
+            img_data = base64.b64decode(base64_data)
+            nparr = np.frombuffer(img_data, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if frame is not None:
+                frame_id_counter += 1
+                with capture_lock:
+                    if node_id not in node_pending_frames:
+                        node_pending_frames[node_id] = {}
+                    node_pending_frames[node_id]["frame"] = frame
+                    node_pending_frames[node_id]["id"] = frame_id_counter
+                global_capture_event.set()
+    except WebSocketDisconnect:
+        if node_id in active_camera_nodes:
+            active_camera_nodes.remove(node_id)
+
+@app.get("/api/nodes")
+def get_active_nodes():
+    return list(active_camera_nodes)
 
 
 import torch
@@ -84,26 +125,22 @@ class MockArgs:
     fp16 = False
 
 def tracking_loop():
-    global latest_frame
-    global latest_raw_frame
     print("[INFO] Initializing YOLO Tracker...")
     args = MockArgs()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    exp = get_exp("exps/example/mot/yolox_x_mix_det.py", None)
+    exp = get_exp("exps/example/mot/yolox_s_mix_det.py", None)
     exp.test_conf = 0.25
     model = exp.get_model().to(device)
     model.eval()
-    
-    ckpt_file = "pretrained/bytetrack_x_mot17.pth.tar"
+
+    ckpt_file = "pretrained/bytetrack_s_mot17.pth.tar"
     print(f"[INFO] Loading checkpoint {ckpt_file}...")
     ckpt = torch.load(ckpt_file, map_location="cpu")
     ckpt_state_dict = ckpt["model"] if "model" in ckpt else ckpt
     model.load_state_dict(ckpt_state_dict, strict=False)
     
     predictor = Predictor(model, exp, None, None, device, args.fp16)
-    tracker = BYTETracker(args, frame_rate=30)
-    timer = Timer()
     
     print("[INFO] Initializing FRS Pipeline...")
     global frs_pipeline_instance
@@ -114,23 +151,54 @@ def tracking_loop():
         match_threshold=0.45,
     )
     frs_pipeline_instance = frs_pipeline
-    last_alert_time = {}
     
-    print("[INFO] Starting Webcam capture...")
-    cap = cv2.VideoCapture(0)
-    frame_count = 0
+    import os
+    camera_source = os.environ.get("CAMERA_SOURCE", "0")
+    if camera_source.isdigit():
+        camera_source = int(camera_source)
+    threading.Thread(target=capture_loop, args=(camera_source,), daemon=True).start()
+
+    trackers = {}
+    last_seen_ids = {}
+    last_alert_times = {}
+    frame_counts = {}
+
     while True:
-        success, frame = cap.read()
-        if not success:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            continue
+        global_capture_event.wait(timeout=0.1)
+        global_capture_event.clear()
+
+        with capture_lock:
+            nodes_to_process = list(node_pending_frames.keys())
             
-        # Encode raw frame before any AI bounding boxes are drawn
-        with lock:
-            ret_raw, buffer_raw = cv2.imencode('.jpg', frame)
-            if ret_raw:
-                latest_raw_frame = buffer_raw.tobytes()
+        for node_id in nodes_to_process:
+            with capture_lock:
+                node_data = node_pending_frames.get(node_id, {})
+                frame = node_data.get("frame")
+                fid = node_data.get("id")
+            
+            if frame is None or fid == last_seen_ids.get(node_id, -1):
+                continue
                 
+            last_seen_ids[node_id] = fid
+            
+            if node_id not in trackers:
+                trackers[node_id] = BYTETracker(args, frame_rate=30)
+                last_alert_times[node_id] = {}
+                frame_counts[node_id] = 0
+
+            tracker = trackers[node_id]
+            last_alert_time = last_alert_times[node_id]
+            frame_counts[node_id] += 1
+            timer = Timer()
+
+            with lock:
+                ret_raw, buffer_raw = cv2.imencode('.jpg', frame, JPEG_ENCODE_PARAMS)
+                if ret_raw:
+                    if node_id not in node_latest_raw_frames:
+                        node_latest_raw_frames[node_id] = {"version": 0}
+                    node_latest_raw_frames[node_id]["bytes"] = buffer_raw.tobytes()
+                    node_latest_raw_frames[node_id]["version"] += 1
+
         outputs, img_info = predictor.inference(frame, timer)
         if outputs[0] is not None:
             online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
@@ -151,9 +219,8 @@ def tracking_loop():
                 img_info['raw_img'], online_tlwhs, online_ids, online_scores, current_time=time.time()
             )
             
-            # Draw AI bounding boxes on the frame
             frame = FRSVisualizer.draw_frs_overlay(
-                img_info['raw_img'], online_tlwhs, online_ids, frs_results, frame_id=frame_count, fps=1./max(1e-5, timer.average_time)
+                img_info['raw_img'], online_tlwhs, online_ids, frs_results, frame_id=frame_counts[node_id], fps=1./max(1e-5, timer.average_time)
             )
             
             # Send alerts for matched VIPs/Suspects
@@ -166,67 +233,153 @@ def tracking_loop():
                 if person_id and person_id != 'UNKNOWN' and res.get('confidence', 0) > 0.45:
                     if now - last_alert_time.get(person_id, 0) > 3:
                         last_alert_time[person_id] = now
-                        print(f"[ALERT] Broadcasting FRS_HIT for {res.get('name')}")
+                        print(f"[ALERT] Broadcasting FRS_HIT for {res.get('name')} from node {node_id}")
                         broadcast_alert({
                             "type": "FRS_HIT",
                             "name": res.get("name", "Unknown"),
                             "category": res.get("category", "UNKNOWN"),
                             "timestamp": now,
-                            "plate": person_id  # Mocking as plate for generic alert UI if needed
+                            "plate": person_id,
+                            "node_id": node_id
                         })
-        
-        # Removed BSF text overlay
-        
-        frame_count += 1
             
-        with lock:
-            ret, buffer = cv2.imencode('.jpg', frame)
-            if ret:
-                latest_frame = buffer.tobytes()
+            with lock:
+                ret, buffer = cv2.imencode('.jpg', frame, JPEG_ENCODE_PARAMS)
+                if ret:
+                    if node_id not in node_latest_frames:
+                        node_latest_frames[node_id] = {"version": 0}
+                    node_latest_frames[node_id]["bytes"] = buffer.tobytes()
+                    node_latest_frames[node_id]["version"] += 1
+
+def capture_loop(camera_source):
+    # Default capture loop adds a 'local_camera' node
+    import requests
+    node_id = "local_camera"
+    active_camera_nodes.add(node_id)
+
+    def publish(frame):
+        nonlocal node_id
+        with capture_lock:
+            if node_id not in node_pending_frames:
+                node_pending_frames[node_id] = {"id": 0}
+            node_pending_frames[node_id]["frame"] = frame
+            node_pending_frames[node_id]["id"] += 1
+        global_capture_event.set()
+
+    if is_ip_camera:
+        print(f"[INFO] Connecting to IP Camera MJPEG stream: {camera_source}")
+        bytes_buffer = b''
+
+        def connect_stream():
+            try:
+                return requests.get(camera_source, stream=True, timeout=5).iter_content(chunk_size=8192)
+            except Exception:
+                return None
+
+        stream = connect_stream()
+        while True:
+            if stream is None:
+                time.sleep(1.0)
+                stream = connect_stream()
+                continue
+            try:
+                chunk = next(stream)
+                bytes_buffer += chunk
+                # Guard against unbounded growth if JPEG markers are never found
+                # (e.g. CAMERA_SOURCE pointing at an HTML page instead of the
+                # MJPEG endpoint, which is /video for the IP Webcam app).
+                if len(bytes_buffer) > 2_000_000:
+                    bytes_buffer = bytes_buffer[-200_000:]
+                a = bytes_buffer.find(b'\xff\xd8')
+                b = bytes_buffer.find(b'\xff\xd9')
+                if a != -1 and b != -1:
+                    jpg = bytes_buffer[a:b + 2]
+                    bytes_buffer = bytes_buffer[b + 2:]
+                    frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    if frame is not None:
+                        frame = cv2.resize(frame, (640, 480))
+                        publish(frame)
+            except StopIteration:
+                print("[WARN] Stream ended, reconnecting...")
+                stream = connect_stream()
+            except Exception as e:
+                print(f"[WARN] Stream read error: {e}")
+                stream = connect_stream()
+    else:
+        print(f"[INFO] Starting Webcam capture from source: {camera_source}")
+        cap = cv2.VideoCapture(camera_source)
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        while True:
+            success, frame = cap.read()
+            if not success:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+            publish(frame)
 
 # Start tracking in background
 threading.Thread(target=tracking_loop, daemon=True).start()
 
-def frame_generator():
+def frame_generator(node_id: str):
+    last_version = -1
+    last_sent = 0.0
+    min_interval = 1.0 / 60.0  # cap at 60fps
     while True:
         with lock:
-            frame = latest_frame
-        if frame is not None:
+            node_data = node_latest_frames.get(node_id, {})
+            frame = node_data.get("bytes")
+            version = node_data.get("version", -1)
+        now = time.time()
+        if frame is not None and version != last_version and (now - last_sent) >= min_interval:
+            last_version = version
+            last_sent = now
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        time.sleep(0.033)
+        else:
+            time.sleep(0.004)
 
-def raw_frame_generator():
+def raw_frame_generator(node_id: str):
+    last_version = -1
+    last_sent = 0.0
+    min_interval = 1.0 / 60.0  # cap at 60fps
     while True:
         with lock:
-            frame = latest_raw_frame
-        if frame is not None:
+            node_data = node_latest_raw_frames.get(node_id, {})
+            frame = node_data.get("bytes")
+            version = node_data.get("version", -1)
+        now = time.time()
+        if frame is not None and version != last_version and (now - last_sent) >= min_interval:
+            last_version = version
+            last_sent = now
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        time.sleep(0.033)
+        else:
+            time.sleep(0.004)
 
-@app.get("/api/stream")
-def video_feed():
-    return StreamingResponse(frame_generator(), media_type="multipart/x-mixed-replace; boundary=frame")
+@app.get("/api/stream/{node_id}")
+def video_feed(node_id: str):
+    return StreamingResponse(frame_generator(node_id), media_type="multipart/x-mixed-replace; boundary=frame")
 
-@app.get("/api/stream/raw")
-def raw_video_feed():
-    return StreamingResponse(raw_frame_generator(), media_type="multipart/x-mixed-replace; boundary=frame")
+@app.get("/api/stream/raw/{node_id}")
+def raw_video_feed(node_id: str):
+    return StreamingResponse(raw_frame_generator(node_id), media_type="multipart/x-mixed-replace; boundary=frame")
 
 from fastapi import Response
 
-@app.get("/api/snapshot")
-def get_snapshot():
+@app.get("/api/snapshot/{node_id}")
+def get_snapshot(node_id: str):
     with lock:
-        frame = latest_frame
+        frame = node_latest_frames.get(node_id, {}).get("bytes")
     if frame is not None:
         return Response(content=frame, media_type="image/jpeg")
     return {"error": "no frame available"}
 
-@app.get("/api/snapshot/raw")
-def get_raw_snapshot():
+@app.get("/api/snapshot/raw/{node_id}")
+def get_raw_snapshot(node_id: str):
     with lock:
-        frame = latest_raw_frame
+        frame = node_latest_raw_frames.get(node_id, {}).get("bytes")
     if frame is not None:
         return Response(content=frame, media_type="image/jpeg")
     return {"error": "no raw frame available"}

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -8,6 +9,23 @@ import { Button } from "@/components/ui/button";
 import { BrainCircuit, Search, User, Clock, Trash } from "lucide-react";
 
 export default function AdminDashboardPage() {
+  const router = useRouter();
+  useEffect(() => {
+    const userStr = localStorage.getItem("trackrz_user");
+    if (!userStr) {
+      router.push("/");
+    } else {
+      try {
+        const user = JSON.parse(userStr);
+        if (user.role !== "superadmin") {
+          router.push("/dashboard");
+        }
+      } catch (e) {
+        router.push("/");
+      }
+    }
+  }, [router]);
+
   const [persons, setPersons] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState("ALL");
@@ -76,7 +94,7 @@ export default function AdminDashboardPage() {
         </div>
       </div>
       {/* Enrolled Persons Directory */}
-      <Card className="border-border/50 bg-secondary/20 flex-1">
+      <Card className="glass-panel border-border/50 bg-secondary/20 flex-1">
         <div className="p-6 border-b border-border/50 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
           <div>
             <h3 className="font-semibold text-lg flex items-center gap-2">

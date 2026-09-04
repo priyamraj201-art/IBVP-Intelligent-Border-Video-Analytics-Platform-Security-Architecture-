@@ -34,9 +34,15 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           disableTransitionOnChange
         >
           <Sidebar />
-          <main className="flex-1 overflow-y-auto">
+          <main className="flex-1 overflow-y-auto relative z-10 bg-background/50">
             {children}
           </main>
+          {/* Global Animated Background */}
+          <div className="fixed inset-0 z-0 pointer-events-none">
+            <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-primary/10 rounded-full blur-[120px] animate-pulse" />
+            <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-chart-4/10 rounded-full blur-[120px] animate-pulse delay-1000" />
+            <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.01)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.01)_1px,transparent_1px)] bg-[size:60px_60px] opacity-20 dark:opacity-100" />
+          </div>
         </ThemeProvider>
       </body>
     </html>

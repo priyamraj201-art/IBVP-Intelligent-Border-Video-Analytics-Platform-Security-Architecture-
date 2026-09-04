@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
+import { useRouter } from "next/navigation";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,6 +12,23 @@ import ReactCrop, { Crop, PixelCrop } from 'react-image-crop';
 import 'react-image-crop/dist/ReactCrop.css';
 
 export default function RegisterPage() {
+  const router = useRouter();
+  useEffect(() => {
+    const userStr = localStorage.getItem("trackrz_user");
+    if (!userStr) {
+      router.push("/");
+    } else {
+      try {
+        const user = JSON.parse(userStr);
+        if (user.role !== "superadmin") {
+          router.push("/dashboard");
+        }
+      } catch (e) {
+        router.push("/");
+      }
+    }
+  }, [router]);
+
   const [mode, setMode] = useState<"camera" | "upload">("camera");
   const [imageSrc, setImageSrc] = useState<string | null>(null);
   
@@ -156,7 +174,7 @@ export default function RegisterPage() {
   return (
     <div className="flex h-full flex-col p-6 space-y-6 max-w-4xl mx-auto w-full">
       <div className="flex items-center gap-4">
-          <Link href="/">
+          <Link href="/dashboard">
             <Button variant="outline" size="icon" type="button">
               <ArrowLeft className="w-4 h-4" />
             </Button>
@@ -170,7 +188,7 @@ export default function RegisterPage() {
       <form onSubmit={handleSubmit} className="grid grid-cols-1 md:grid-cols-2 gap-6 flex-1">
         
         {/* Left Column: Image Capture/Upload/Crop */}
-        <Card className="flex flex-col border-2 border-border/60 bg-card shadow-lg shadow-black/5 overflow-hidden">
+        <Card className="glass-panel flex flex-col border-2 border-border/60 bg-card shadow-lg shadow-black/5 overflow-hidden">
           <div className="flex border-b border-border/50">
             <button
               type="button"
@@ -292,7 +310,7 @@ export default function RegisterPage() {
         </Card>
 
         {/* Right Column: Identity Details */}
-        <Card className="flex flex-col border-2 border-border/60 bg-card shadow-lg shadow-black/5">
+        <Card className="glass-panel flex flex-col border-2 border-border/60 bg-card shadow-lg shadow-black/5">
           <div className="p-6 border-b border-border/50 bg-secondary/10">
             <h3 className="font-semibold text-lg flex items-center gap-2">
               <UserPlus className="w-5 h-5 text-primary" />
