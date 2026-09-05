@@ -152,3 +152,5 @@ yarn-error.log*
 # Next.js
 .next/
 out/
+
+gap_analysis.md
